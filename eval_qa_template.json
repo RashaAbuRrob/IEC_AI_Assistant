@@ -1,0 +1,13 @@
+[
+  {
+    "question": "ضع هنا سؤالاً حقيقياً من محتوى الوثائق",
+    "in_scope": true,
+    "expected_source_file": "اسم_الملف.pdf",
+    "expected_page": 3,
+    "expected_article": "5"
+  },
+  {
+    "question": "ما هي عاصمة اليابان؟",
+    "in_scope": false
+  }
+]

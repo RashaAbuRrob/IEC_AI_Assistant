@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+chroma_db/
+
+# Claude Code local machine settings (not shared project config)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Vendored third-party lip-sync/voice stacks and their model checkpoints --
+# large (GBs), machine-specific installs, not this project's source. See
+# lipsync_utils.py / wav2lip_onnx_lib usage for how they're wired in;
+# re-fetch/re-install per that code's expectations rather than committing them.
+sadtalker_lib/
+wav2lip_onnx_lib/
+iecwl/
+tessdata/
+
+# Ad-hoc manual test/debug outputs from developing the voice + lip-sync
+# features -- not fixtures read by any automated test.
+speak_test.mp3
+test_lipsync_audio.*
+test_lipsync_output*.mp4
+lipsync_endpoint_test.mp4
+voice_clone_test.wav
+voice_reference.wav
+welcome_greeting.mp4
