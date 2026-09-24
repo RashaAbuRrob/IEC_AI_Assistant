@@ -14,11 +14,33 @@ import argparse
 import re
 import sys
 
+import gemini_utils
 from arabic_utils import normalize_arabic
 from chroma_utils import get_collection
-from ollama_utils import generate_answer, prewarm_embedder
+from ollama_utils import GEN_MODEL_QWEN25, generate_answer, prewarm_embedder
+from ollama_utils import stream_generate_answer as _ollama_stream_generate_answer
 
 REFUSAL = "لا تتوفر لدي معلومات كافية للإجابة على هذا السؤال"
+
+# Models selectable from the UI. "auto" is the default: try Gemini Flash
+# first (fast, cloud-hosted) and fall back to the local Qwen3 14B (via
+# Ollama) if Gemini is unconfigured or its call fails before producing any
+# output. Picking "gemini", "qwen", or "qwen25" explicitly pins that model
+# with no fallback -- an explicit choice should fail visibly rather than
+# silently run a different model than the one asked for.
+AVAILABLE_MODELS = {
+    "auto": "تلقائي (Gemini Flash، مع Qwen3 المحلي كخيار احتياطي)",
+    "gemini": "Gemini Flash",
+    "qwen": "Qwen3 14B (محلي)",
+    "qwen25": "Qwen2.5 1.5B (محلي، أسرع)",
+}
+DEFAULT_MODEL = "auto"
+
+# Local (Ollama) models behind each non-Gemini choice.
+_OLLAMA_MODEL_BY_CHOICE = {
+    "qwen": None,  # None -> ollama_utils.GEN_MODEL default (qwen3:14b)
+    "qwen25": GEN_MODEL_QWEN25,
+}
 
 # قانون الانتخاب رقم 6 لسنة 2016 has been superseded by قانون الانتخاب رقم
 # (4) لسنة 2022. Presenting its (possibly repealed) clauses alongside the
@@ -58,6 +80,50 @@ SYSTEM_PROMPT = f"""أنت مساعد بحثي يجيب حصراً بالاعت�
    الاستثناء الوحيد: أرقام المواد والشروط والمبالغ والمهل الزمنية تُذكر كما وردت حرفياً في النص الأصلي دون أي تغيير أو ترجمة.
 6. اجعل إجاباتك قصيرة ومختصرة قدر الإمكان ومناسبة لأن تُقرأ بصوت عالٍ في محادثة صوتية -- لخّص الفكرة الأساسية دون تعداد كل التفاصيل الفرعية، إلا إذا طلب السائل التفاصيل صراحةً.
 """
+
+
+def stream_answer(system_prompt: str, user_prompt: str, model: str = DEFAULT_MODEL):
+    """
+    Generator yielding events describing which model is answering and the
+    streamed answer text, so callers can forward both to the client:
+      {"event": "model", "model": "gemini"|"qwen"|"qwen25", "fallback": bool}
+      {"event": "text", "text": "<chunk>"}
+
+    See AVAILABLE_MODELS for what "auto"/"gemini"/"qwen"/"qwen25" mean.
+    """
+    if model not in AVAILABLE_MODELS:
+        raise ValueError(f"Unknown model choice: {model!r}")
+
+    if model in ("auto", "gemini"):
+        if not gemini_utils.is_configured():
+            if model == "gemini":
+                raise RuntimeError("GEMINI_API_KEY غير مضبوط على الخادم.")
+        else:
+            gemini_failed = False
+            chunks = gemini_utils.stream_generate_answer(system_prompt, user_prompt)
+            try:
+                first_chunk = next(chunks, None)
+            except Exception as e:
+                if model == "gemini":
+                    raise
+                print(f"[stream_answer] Gemini call failed, falling back to Qwen3: {e}")
+                gemini_failed = True
+            if not gemini_failed:
+                yield {"event": "model", "model": "gemini", "fallback": False}
+                if first_chunk:
+                    yield {"event": "text", "text": first_chunk}
+                for chunk in chunks:
+                    yield {"event": "text", "text": chunk}
+                return
+
+    # "auto" falls back here to qwen3 (GEN_MODEL default); "qwen"/"qwen25"
+    # were picked explicitly and each map to their own local model.
+    local_choice = model if model in _OLLAMA_MODEL_BY_CHOICE else "qwen"
+    ollama_model = _OLLAMA_MODEL_BY_CHOICE[local_choice]
+    kwargs = {"model": ollama_model} if ollama_model else {}
+    yield {"event": "model", "model": local_choice, "fallback": model == "auto"}
+    for chunk in _ollama_stream_generate_answer(system_prompt, user_prompt, **kwargs):
+        yield {"event": "text", "text": chunk}
 
 
 def format_context(results):

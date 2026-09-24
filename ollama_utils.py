@@ -15,6 +15,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 EMBED_MODEL = "bge-m3"
 GEN_MODEL = "qwen3:14b"
+GEN_MODEL_QWEN25 = "qwen2.5:1.5b-instruct-q8_0"
 VISION_MODEL = "qwen2.5vl"
 
 # Keep bge-m3 resident in memory since it is hit on every add() and every
@@ -60,16 +61,16 @@ def embed_text(text: str, retries: int = 3, backoff: float = 1.5):
     raise RuntimeError(f"bge-m3 embedding failed after {retries} attempts: {last_err}")
 
 
-def generate_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0):
+def generate_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0, model: str = GEN_MODEL):
     """
-    Call qwen3:14b for the final answer generation. temperature=0.0 for
-    factual, low-variance answers (this is a citation-bound QA task, not
-    creative generation).
+    Call a local Ollama model (qwen3:14b by default) for the final answer
+    generation. temperature=0.0 for factual, low-variance answers (this is
+    a citation-bound QA task, not creative generation).
     """
     r = requests.post(
         f"{OLLAMA_HOST}/api/generate",
         json={
-            "model": GEN_MODEL,
+            "model": model,
             "system": system_prompt,
             "prompt": user_prompt,
             "stream": False,
@@ -85,7 +86,7 @@ def generate_answer(system_prompt: str, user_prompt: str, temperature: float = 0
     return data.get("response", "").strip()
 
 
-def stream_generate_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0):
+def stream_generate_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0, model: str = GEN_MODEL):
     """
     Same call as generate_answer(), but streams response fragments as they
     arrive from Ollama instead of waiting for the full completion. Yields
@@ -95,7 +96,7 @@ def stream_generate_answer(system_prompt: str, user_prompt: str, temperature: fl
     with requests.post(
         f"{OLLAMA_HOST}/api/generate",
         json={
-            "model": GEN_MODEL,
+            "model": model,
             "system": system_prompt,
             "prompt": user_prompt,
             "stream": True,

@@ -4,9 +4,10 @@ Local API server for the IEC RAG chat UI (static/index.html).
 
 Matches the contract the frontend already expects:
   POST /api/assistant/query
-  body: {"query": "...", "history": [...], "stream": true}
+  body: {"query": "...", "history": [...], "model": "auto"|"gemini"|"qwen"|"qwen25"}
   response: newline-delimited JSON (NDJSON), one object per line:
     {"type": "sources", "context_sources": [{"filename": "...", "page": N, "article_number": "..."}]}
+    {"type": "model", "model": "gemini"|"qwen"|"qwen25", "fallback": bool}   -- which model is answering
     {"type": "text", "text": "<fragment>"}   -- zero or more, streamed as generated
 
 Usage:
@@ -23,12 +24,20 @@ import json
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+import gemini_utils
 from arabic_utils import normalize_arabic
 from chroma_utils import get_collection
 from lipsync_utils import generate_lipsync_video
-from ollama_utils import prewarm_embedder, stream_generate_answer
-from rag_service import REFUSAL, SYSTEM_PROMPT, build_where_filter, format_context
-from voice_clone_utils import synthesize_cloned_speech
+from ollama_utils import prewarm_embedder
+from rag_service import (
+    AVAILABLE_MODELS,
+    DEFAULT_MODEL,
+    REFUSAL,
+    SYSTEM_PROMPT,
+    build_where_filter,
+    format_context,
+    stream_answer,
+)
 from voice_output_utils import synthesize_speech
 from whisper_utils import prewarm as prewarm_whisper, transcribe_arabic
 
@@ -65,11 +74,28 @@ def health():
     )
 
 
+@app.route("/api/models")
+def models():
+    """Lets the frontend build a model-choice dropdown. "available" marks
+    Gemini as usable only if GEMINI_API_KEY is actually configured on the
+    server -- the UI can grey it out / warn otherwise instead of letting
+    the user pick a model that will just error out."""
+    return jsonify(
+        {
+            "default": DEFAULT_MODEL,
+            "options": [
+                {"id": model_id, "label": label, "available": model_id != "gemini" or gemini_utils.is_configured()}
+                for model_id, label in AVAILABLE_MODELS.items()
+            ],
+        }
+    )
+
+
 @app.route("/api/tts/status")
 def tts_status():
-    """Lets the frontend know the human Jordanian voice endpoint exists
-    (no config/key needed -- it's edge-tts, always available as long as
-    the server has internet access to Microsoft's TTS service)."""
+    """Lets the frontend know the voice endpoint exists -- Gemini TTS
+    when GEMINI_API_KEY is configured, else edge-tts, either way always
+    available as long as the server has internet access."""
     return jsonify({"voice_available": True})
 
 
@@ -80,12 +106,12 @@ def speak():
     if not text:
         return jsonify({"error": "text is required"}), 400
     try:
-        audio_bytes = synthesize_speech(text)
+        audio_bytes, mimetype = synthesize_speech(text)
     except Exception as e:  # noqa: BLE001 -- surface any failure to the UI instead of hanging it
         # Network/service hiccup -- the frontend falls back to the
         # browser's built-in voice on any non-2xx response here.
         return jsonify({"error": str(e)}), 502
-    return Response(audio_bytes, mimetype="audio/mpeg")
+    return Response(audio_bytes, mimetype=mimetype)
 
 
 @app.route("/api/assistant/lipsync", methods=["POST"])
@@ -99,29 +125,11 @@ def lipsync():
     if not text:
         return jsonify({"error": "text is required"}), 400
     try:
-        audio_bytes = synthesize_speech(text)
+        audio_bytes, _mimetype = synthesize_speech(text)
         video_bytes = generate_lipsync_video(audio_bytes)
     except Exception as e:  # noqa: BLE001 -- surface any failure to the UI instead of hanging it
         return jsonify({"error": str(e)}), 502
     return Response(video_bytes, mimetype="video/mp4")
-
-
-@app.route("/api/assistant/speak_cloned", methods=["POST"])
-def speak_cloned():
-    """Generates audio in the real, authorized human voice reference
-    (chatterbox-tts, CPU) instead of the stock edge-tts voice. Slow --
-    roughly 25-30s model load (once) plus ~10s per second of output
-    audio -- so this is opt-in per-message in the UI, not the automatic
-    default voice."""
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "text is required"}), 400
-    try:
-        audio_bytes = synthesize_cloned_speech(text)
-    except Exception as e:  # noqa: BLE001 -- surface any failure to the UI instead of hanging it
-        return jsonify({"error": str(e)}), 502
-    return Response(audio_bytes, mimetype="audio/wav")
 
 
 @app.route("/api/assistant/transcribe", methods=["POST"])
@@ -145,6 +153,9 @@ def assistant_query():
     query = (data.get("query") or "").strip()
     if not query:
         return jsonify({"error": "query is required"}), 400
+    model = (data.get("model") or DEFAULT_MODEL).strip()
+    if model not in AVAILABLE_MODELS:
+        return jsonify({"error": f"Unknown model choice: {model}"}), 400
 
     k = _state["k"]
 
@@ -180,8 +191,11 @@ def assistant_query():
             context = format_context(results)
             user_prompt = f"المقاطع المسترجعة:\n\n{context}\n\nالسؤال: {query}\n\nالإجابة:"
 
-            for chunk in stream_generate_answer(SYSTEM_PROMPT, user_prompt):
-                yield emit({"type": "text", "text": chunk})
+            for event in stream_answer(SYSTEM_PROMPT, user_prompt, model=model):
+                if event["event"] == "model":
+                    yield emit({"type": "model", "model": event["model"], "fallback": event["fallback"]})
+                else:
+                    yield emit({"type": "text", "text": event["text"]})
 
         except Exception as e:  # noqa: BLE001 -- surface any failure to the UI instead of hanging it
             yield emit({"type": "text", "text": f"\n\n[خطأ في الخادم: {e}]"})

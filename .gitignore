@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 chroma_db/
 
+# Local secrets (Gemini API key, etc.) -- see .env.example for the template.
+.env
+
 # Claude Code local machine settings (not shared project config)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

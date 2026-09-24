@@ -485,6 +485,47 @@
       border-color: transparent;
     }
 
+    .topbar-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .model-select {
+      height: 40px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid #d9e3e8;
+      background: linear-gradient(180deg, #edf2f5, #e7edf1);
+      color: var(--ink);
+      font-family: 'Cairo', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      max-width: 150px;
+    }
+
+    .model-select option:disabled {
+      color: #b7c0c6;
+    }
+
+    .model-badge {
+      display: inline-block;
+      margin-inline-start: 6px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      background: #e7edf1;
+      color: #6b7780;
+      vertical-align: middle;
+    }
+
+    .model-badge.fallback {
+      background: #fff1cc;
+      color: #8a6d1a;
+    }
+
     .speak-btn {
       cursor: pointer;
       border: none;
@@ -641,9 +682,12 @@
             </div>
           </div>
 
-          <button class="voice-toggle" id="voiceToggle" type="button" title="قراءة إجابات المساعد صوتياً">
-            <span id="voiceToggleIcon">🔇</span> قراءة صوتية
-          </button>
+          <div class="topbar-controls">
+            <select class="model-select" id="modelSelect" title="اختر النموذج المستخدم للإجابة"></select>
+            <button class="voice-toggle" id="voiceToggle" type="button" title="قراءة إجابات المساعد صوتياً">
+              <span id="voiceToggleIcon">🔇</span> قراءة صوتية
+            </button>
+          </div>
         </div>
 
         <section class="messages" id="messages">
@@ -677,7 +721,7 @@
     </div>
   </div>
 
-  <div class="spokesperson" title="اسحب لتحريك المتحدث">
+  <div class="spokesperson" title="اضغط لإعادة تشغيل آخر رد بالفيديو -- اسحب لتحريك المتحدث">
     <video class="spokesperson-video idle" id="avatarVideo" src="avatar_alpha.webm" muted loop playsinline preload="auto"></video>
   </div>
 
@@ -687,9 +731,36 @@
     const sendBtn = document.getElementById('sendBtn');
     const messagesContainer = document.getElementById('messages');
     const quickPrompts = document.querySelectorAll('.quick-pill');
+    const modelSelect = document.getElementById('modelSelect');
 
     let typingRow = null;
     let conversationHistory = [];
+
+    // ---------------------------------------------------------------------
+    // Model choice (Gemini Flash by default, with the local Qwen3 14B as
+    // an automatic fallback if Gemini is unavailable -- see rag_service.py
+    // AVAILABLE_MODELS). Populated from the server so a Gemini option only
+    // shows as pickable when GEMINI_API_KEY is actually configured there;
+    // the user's last choice is remembered across reloads.
+    // ---------------------------------------------------------------------
+    let selectedModel = 'auto';
+    fetch(`${API_BASE_URL}/models`)
+      .then(r => r.json())
+      .then(data => {
+        const saved = (() => { try { return localStorage.getItem('iec_selected_model'); } catch (e) { return null; } })();
+        modelSelect.innerHTML = data.options.map(opt =>
+          `<option value="${opt.id}" ${opt.available ? '' : 'disabled'}>${opt.label}${opt.available ? '' : ' (غير مفعّل)'}</option>`
+        ).join('');
+        const wanted = data.options.find(o => o.id === saved && o.available) ? saved : data.default;
+        modelSelect.value = wanted;
+        selectedModel = wanted;
+      })
+      .catch(() => { /* /api/models unreachable -- keep the default "auto" silently */ });
+
+    modelSelect.addEventListener('change', () => {
+      selectedModel = modelSelect.value;
+      try { localStorage.setItem('iec_selected_model', selectedModel); } catch (e) { /* ignore */ }
+    });
 
     // ---------------------------------------------------------------------
     // Spokesperson widget -- draggable by mouse/touch, not just the idle
@@ -737,7 +808,7 @@
         el.style.top = newTop + 'px';
       });
 
-      window.addEventListener('pointerup', () => {
+      window.addEventListener('pointerup', (e) => {
         if (!dragging) return;
         dragging = false;
         el.classList.remove('dragging');
@@ -745,6 +816,11 @@
           const rect = el.getBoundingClientRect();
           localStorage.setItem('iec_spokesperson_pos', JSON.stringify({ left: rect.left, top: rect.top }));
         } catch (e) { /* private mode etc. */ }
+        // A tap (negligible movement) replays the last lip-synced clip;
+        // an actual drag (used to reposition the widget) must not.
+        const movedX = Math.abs(e.clientX - startX);
+        const movedY = Math.abs(e.clientY - startY);
+        if (movedX < 5 && movedY < 5) playCachedLipsync();
       });
 
       window.addEventListener('resize', restorePosition);
@@ -827,10 +903,13 @@
     let lipsyncRequestId = 0;
     let lipsyncObjectUrl = null;
 
+    // Reverts the *visual* to the ambient idle loop only -- deliberately
+    // does NOT touch lipsyncObjectUrl, so the last generated clip stays
+    // cached and clicking the character (see playCachedLipsync) can
+    // replay it later without regenerating.
     function revertAvatarToIdleLoop() {
       if (!avatarVideo) return;
       avatarVideo.pause();
-      if (lipsyncObjectUrl) { URL.revokeObjectURL(lipsyncObjectUrl); lipsyncObjectUrl = null; }
       avatarVideo.src = IDLE_AVATAR_SRC;
       avatarVideo.muted = true;
       avatarVideo.loop = true;
@@ -839,27 +918,55 @@
       avatarVideo.classList.add('idle');
     }
 
+    // (re)plays whatever lip-synced clip is currently cached in
+    // lipsyncObjectUrl, from the start, with sound -- used both right
+    // after a fresh clip is generated and every time the character is
+    // clicked afterwards.
+    function playCachedLipsync() {
+      if (!avatarVideo || !lipsyncObjectUrl) return false;
+      avatarVideo.loop = false;
+      avatarVideo.muted = false;
+      avatarVideo.src = lipsyncObjectUrl;
+      avatarVideo.currentTime = 0;
+      avatarVideo.classList.remove('idle');
+      avatarVideo.classList.add('speaking');
+      avatarVideo.onended = revertAvatarToIdleLoop;
+      avatarVideo.play().catch(() => { /* autoplay restrictions etc. */ });
+      return true;
+    }
+
     // ---------------------------------------------------------------------
-    // On page load, play a pre-generated greeting in the cloned human
-    // voice (static/greeting_cloned.wav -- generated once offline via
-    // chatterbox-tts, not live, so the page never waits on generation).
-    // The video just keeps looping normally (muted) with the glow synced
-    // to the greeting audio. Browsers block unmuted-audio autoplay before
-    // any user gesture, so if the initial attempt is rejected, it waits
-    // for the first click/keypress anywhere on the page and plays it then.
+    // On page load, play the spokesperson video's own original audio
+    // (the real recording baked into avatar_alpha.webm) once, unmuted --
+    // not synthesized or cloned speech. Browsers block unmuted-audio
+    // autoplay before any user gesture, so if the initial attempt is
+    // rejected, it waits for the first click/keypress anywhere on the
+    // page and plays it then. Afterwards the video returns to its normal
+    // muted, paused idle state.
     // ---------------------------------------------------------------------
     function playOriginalGreeting() {
-      const greeting = new Audio('greeting_cloned.wav');
-      greeting.onplay = startAvatarSpeaking;
-      greeting.onended = stopAvatarSpeaking;
-      greeting.onerror = stopAvatarSpeaking;
-      const playPromise = greeting.play();
+      if (!avatarVideo) return;
+      avatarVideo.loop = false;
+      avatarVideo.muted = false;
+      avatarVideo.currentTime = 0;
+      avatarVideo.classList.remove('idle');
+      avatarVideo.classList.add('speaking');
+      avatarVideo.onended = () => {
+        avatarVideo.onended = null;
+        avatarVideo.pause();
+        avatarVideo.muted = true;
+        avatarVideo.loop = true;
+        avatarVideo.currentTime = 0;
+        avatarVideo.classList.remove('speaking');
+        avatarVideo.classList.add('idle');
+      };
+      const playPromise = avatarVideo.play();
       if (playPromise && playPromise.catch) {
         playPromise.catch(() => {
           const unlock = () => {
             document.removeEventListener('click', unlock);
             document.removeEventListener('keydown', unlock);
-            greeting.play().catch(() => {});
+            avatarVideo.play().catch(() => {});
           };
           document.addEventListener('click', unlock, { once: true });
           document.addEventListener('keydown', unlock, { once: true });
@@ -888,14 +995,8 @@
 
         if (lipsyncObjectUrl) URL.revokeObjectURL(lipsyncObjectUrl);
         lipsyncObjectUrl = URL.createObjectURL(blob);
-        avatarVideo.loop = false;
-        avatarVideo.muted = false;
-        avatarVideo.src = lipsyncObjectUrl;
-        avatarVideo.classList.remove('idle');
-        avatarVideo.classList.add('speaking');
         clearSpokespersonStatus();
-        avatarVideo.onended = revertAvatarToIdleLoop;
-        await avatarVideo.play().catch(() => { /* autoplay restrictions etc. */ });
+        playCachedLipsync();
         return true;
       } catch (err) {
         if (myRequestId === lipsyncRequestId) {
@@ -906,49 +1007,6 @@
           alert('تعذّر إنشاء الفيديو المطابق للشفاه: ' + err.message);
         }
         return false;
-      }
-    }
-
-    // ---------------------------------------------------------------------
-    // Real cloned voice (chatterbox-tts, CPU -- ~25-30s model load once
-    // plus ~10s per second of output audio, so a full answer can take a
-    // few minutes). Opt-in per-message action, like the "🎬" lip-sync
-    // video button, not the automatic default voice.
-    // ---------------------------------------------------------------------
-    let cloneRequestId = 0;
-
-    async function playClonedVoice(text) {
-      if (!text) return;
-      const myRequestId = ++cloneRequestId;
-      if (window.speechSynthesis) window.speechSynthesis.cancel();
-      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-      stopAvatarSpeaking();
-      setSpokespersonStatus('جاري توليد الصوت الأصلي المستنسخ... (قد يستغرق عدة دقائق)');
-      try {
-        const response = await fetch(`${API_BASE_URL}/assistant/speak_cloned`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text })
-        });
-        if (myRequestId !== cloneRequestId) return; // superseded by a newer request
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || 'cloned voice request failed');
-        }
-        const blob = await response.blob();
-        if (myRequestId !== cloneRequestId) return; // superseded while downloading
-        clearSpokespersonStatus();
-        currentAudio = new Audio(URL.createObjectURL(blob));
-        currentAudio.onplay = startAvatarSpeaking;
-        currentAudio.onended = stopAvatarSpeaking;
-        currentAudio.onpause = stopAvatarSpeaking;
-        currentAudio.onerror = stopAvatarSpeaking;
-        currentAudio.play();
-      } catch (err) {
-        if (myRequestId === cloneRequestId) {
-          clearSpokespersonStatus();
-          alert('تعذّر توليد الصوت الأصلي: ' + err.message);
-        }
       }
     }
 
@@ -1002,18 +1060,12 @@
       }
     }
 
-    // Per-message "listen" (fast audio), "🎬" (real lip-synced video,
-    // slow -- opt-in only), and "🗣️" (real cloned voice, slow -- opt-in
-    // only) buttons. Work regardless of the auto-read toggle.
+    // Per-message "listen" (fast audio) and "🎬" (real lip-synced video,
+    // slow -- opt-in only) buttons. Work regardless of the auto-read toggle.
     messagesContainer.addEventListener('click', (e) => {
       const lipsyncBtn = e.target.closest('.lipsync-btn');
       if (lipsyncBtn) {
         playLipsyncVideo(lipsyncBtn.dataset.text || '');
-        return;
-      }
-      const cloneBtn = e.target.closest('.clone-btn');
-      if (cloneBtn) {
-        playClonedVoice(cloneBtn.dataset.text || '');
         return;
       }
       const btn = e.target.closest('.speak-btn');
@@ -1115,7 +1167,7 @@
         const response = await fetch(`${API_BASE_URL}/assistant/query`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, history: conversationHistory, stream: true })
+          body: JSON.stringify({ query, history: conversationHistory, model: selectedModel, stream: true })
         });
 
         if (response.ok) {
@@ -1125,6 +1177,7 @@
           let answer = '';
           let sources = [];
           let answerBubble = null;
+          let answeredBy = null;
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -1155,6 +1208,8 @@
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
               } else if (event.type === 'sources') {
                 sources = event.context_sources || [];
+              } else if (event.type === 'model') {
+                answeredBy = event;
               }
             }
           }
@@ -1174,13 +1229,28 @@
           }
           if (!answer) answerBubble.textContent = 'لم يتم إنشاء رد.';
           if (answer) {
+            if (answeredBy) {
+              const MODEL_LABELS = { gemini: 'Gemini Flash', qwen: 'Qwen3 (محلي)', qwen25: 'Qwen2.5 (محلي)' };
+              const label = MODEL_LABELS[answeredBy.model] || answeredBy.model;
+              const note = answeredBy.fallback ? ' -- تلقائي بعد تعذّر Gemini' : '';
+              answerBubble.insertAdjacentHTML(
+                'beforeend',
+                `<div class="model-badge${answeredBy.fallback ? ' fallback' : ''}" title="النموذج الذي أجاب${note}">${label}</div>`
+              );
+            }
             answerBubble.insertAdjacentHTML(
               'beforeend',
               ` <button class="speak-btn" type="button" title="استماع" data-text="${escapeHtml(answer)}">🔊</button>` +
-              ` <button class="speak-btn lipsync-btn" type="button" title="فيديو مطابق للشفاه (قد يستغرق دقائق)" data-text="${escapeHtml(answer)}">🎬</button>` +
-              ` <button class="speak-btn clone-btn" type="button" title="الصوت الأصلي المستنسخ (قد يستغرق عدة دقائق)" data-text="${escapeHtml(answer)}">🗣️</button>`
+              ` <button class="speak-btn lipsync-btn" type="button" title="فيديو مطابق للشفاه (قد يستغرق دقائق)" data-text="${escapeHtml(answer)}">🎬</button>`
             );
             if (voiceEnabled) speakText(answer);
+            // Real lip-synced video, generated automatically for every
+            // answer (no need to click the per-message button below) --
+            // takes 1-5 minutes, so it appears well after the text/quick
+            // audio. The character then replays this same clip on click
+            // (see initDraggableSpokesperson's tap handling) instead of
+            // re-generating it.
+            playLipsyncVideo(answer);
           }
           conversationHistory.push({ role: 'assistant', content: answer });
         } else {
